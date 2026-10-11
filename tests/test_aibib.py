@@ -1,0 +1,225 @@
+"""Offline tests: every network call is patched out."""
+
+import contextlib
+import io
+import json
+import os
+import tempfile
+import unittest
+import urllib.error
+from unittest.mock import patch
+
+from aibib import bibtex, cli, net, sources
+
+BIB = """@inproceedings{Key_1,
+  title = {A {Title}, with comma},
+  author = "Doe, Jane and Roe, Rick",
+  doi = {10.1007/978-3-030-58452-8_13},
+  note = {x}
+}"""
+
+
+def rec(**kw):
+    base = {"title": "A Paper", "authors": ["Jane Doe 0001", "Rick Roe"], "venue": "ICLR",
+            "year": "2021", "type": "Inproceedings", "dblp": "https://dblp.org/rec/conf/iclr/Doe21",
+            "doi": "", "ee": [], "bibtype": "inproceedings", "booktitle": "ICLR 2021",
+            "journal": "", "volume": "", "pages": "", "url": "https://openreview.net/forum?id=x"}
+    return base | kw
+
+
+class BibTeX(unittest.TestCase):
+    def test_fields_and_key(self):
+        self.assertEqual(bibtex.field(BIB, "title"), "A {Title}, with comma")
+        self.assertEqual(bibtex.field(BIB, "author"), "Doe, Jane and Roe, Rick")
+        self.assertEqual(bibtex.field(BIB, "missing"), "")
+        self.assertEqual(bibtex.key(BIB), "Key_1")
+        self.assertEqual(bibtex.key(bibtex.set_key(BIB, "doe2021")), "doe2021")
+
+    def test_rejects_html_and_multiple(self):
+        for bad in ("<html>nope</html>", BIB + "\n" + BIB, "@article{k, title={x}", "@misc{k, note={x}}"):
+            with self.assertRaises(bibtex.BibError):
+                bibtex.single(bad)
+        with self.assertRaises(bibtex.BibError):
+            bibtex.set_key(BIB, "bad key")
+
+
+class Routing(unittest.TestCase):
+    def test_official(self):
+        cases = {
+            "https://proceedings.neurips.cc/paper/2017/hash/3f5ee243547dee91fbd053c1c4a845aa-Abstract.html":
+                ("NeurIPS", "https://proceedings.neurips.cc/paper_files/paper/2017/hash/3f5ee243547dee91fbd053c1c4a845aa-Abstract.html"),
+            "https://doi.org/10.18653/V1/N19-1423": ("ACL", "https://aclanthology.org/N19-1423/"),
+            "https://aclanthology.org/2020.emnlp-main.317": ("ACL", "https://aclanthology.org/2020.emnlp-main.317/"),
+            "https://proceedings.mlr.press/v139/radford21a.html": ("PMLR", "https://proceedings.mlr.press/v139/radford21a.html"),
+            "https://openaccess.thecvf.com/content_cvpr_2016/papers/He_Deep_CVPR_2016_paper.pdf":
+                ("CVF", "https://openaccess.thecvf.com/content_cvpr_2016/html/He_Deep_CVPR_2016_paper.html"),
+            "https://doi.org/10.1007/978-3-030-58452-8_13": ("Springer", "10.1007/978-3-030-58452-8_13"),
+            "https://doi.org/10.24963/ijcai.2019/12": ("IJCAI", "https://www.ijcai.org/proceedings/2019/12"),
+            "https://doi.org/10.1609/AAAI.V34I07.6693": ("AAAI", "https://ojs.aaai.org/index.php/AAAI/article/view/6693"),
+        }
+        for url, want in cases.items():
+            self.assertEqual(sources.official(url), want, url)
+        for url in ("https://doi.org/10.1109/CVPR.2016.90", "https://openreview.net/forum?id=abc",
+                    "https://example.org/x", "https://doi.org/10.48550/ARXIV.1706.03762"):
+            self.assertIsNone(sources.official(url), url)
+
+    def test_best_official_prefers_open_proceedings_and_skips_preprints(self):
+        r = rec(ee=["https://doi.org/10.1007/978-3-030-58452-8_13",
+                    "https://openaccess.thecvf.com/content/ICCV2021/html/X_paper.html"])
+        self.assertEqual(sources.best_official(r)[0], "CVF")
+        self.assertIsNone(sources.best_official(rec(type="Informal", ee=r["ee"])))
+
+
+class Search(unittest.TestCase):
+    def test_groups_versions_and_ranks_by_title(self):
+        hits = [
+            rec(title="Attention Is All You Need for Speech", authors=["A B"], dblp="https://dblp.org/rec/conf/x/1"),
+            rec(title="Attention Is All You Need", authors=["Ashish Vaswani"], venue="CoRR", type="Informal",
+                dblp="https://dblp.org/rec/journals/corr/V17"),
+            rec(title="Attention is All you Need", authors=["Ashish Vaswani"], venue="NIPS",
+                dblp="https://dblp.org/rec/conf/nips/V17"),
+        ]
+        with patch.object(sources, "sparql_records", return_value=hits) as q:
+            groups = sources.search("attention is all you need")
+        q.assert_called_once_with(["attention is all you need"])
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0]["venue"], "NIPS")  # published before preprint
+        self.assertEqual(len(groups[0]["versions"]), 2)
+
+    def test_falls_back_to_words(self):
+        with patch.object(sources, "sparql_records", side_effect=[[], []]) as q:
+            self.assertEqual(sources.search("low rank adaptation of llms"), [])
+        self.assertEqual(q.call_args_list[1].args[0], ["adaptation", "llms", "rank", "low"])
+
+    def test_sparql_parsing(self):
+        payload = {"results": {"bindings": [{
+            "p": {"value": "https://dblp.org/rec/conf/iclr/SongME21"},
+            "title": {"value": "Denoising Diffusion Implicit Models."},
+            "year": {"value": "2021"}, "venue": {"value": "ICLR"},
+            "types": {"value": "https://dblp.org/rdf/schema#Publication https://dblp.org/rdf/schema#Inproceedings"},
+            "ees": {"value": "https://openreview.net/forum?id=St1giarCHLP"},
+            "authors": {"value": "2|Chenlin Meng\n1|Jiaming Song\n3|Stefano Ermon"},
+            "bibtype": {"value": "http://purl.org/net/nknouf/ns/bibtex#Inproceedings"},
+            "parent": {"value": "9th International Conference on Learning Representations, ICLR 2021."},
+        }]}}
+        with patch.object(sources, "fetch", return_value=("", json.dumps(payload))) as f:
+            [r] = sources.sparql_records(['a "quoted" title'])
+        self.assertIn('\\"quoted\\"', f.call_args.args[1].replace("%5C", "\\").replace("%22", '"'))
+        self.assertEqual(r["authors"], ["Jiaming Song", "Chenlin Meng", "Stefano Ermon"])
+        self.assertEqual((r["title"], r["bibtype"], r["type"]), ("Denoising Diffusion Implicit Models", "inproceedings", "Inproceedings"))
+
+
+class Lookup(unittest.TestCase):
+    def test_metadata_entry(self):
+        bib = sources.dblp_meta_bib(rec(pages="1-10"))
+        self.assertEqual(bibtex.key(bib), "DBLP:conf/iclr/Doe21")
+        self.assertEqual(bibtex.field(bib, "author"), "Jane Doe and Rick Roe")
+        self.assertEqual(bibtex.field(bib, "booktitle"), "ICLR 2021")
+        self.assertEqual(bibtex.field(bib, "pages"), "1--10")
+        self.assertEqual(bibtex.field(bib, "journal"), "")
+
+    def test_fallback_chain(self):
+        r = rec(ee=["https://proceedings.mlr.press/v1/a.html"], doi="10.1/x")
+        with patch.object(sources, "official_bib", side_effect=net.FetchError("boom")), \
+             patch.object(sources, "doi_bib", return_value=BIB):
+            bib, src = sources.lookup(r)
+        self.assertEqual(bib, BIB)
+        self.assertTrue(src.startswith("DOI (official PMLR failed: boom)"))
+        with patch.object(sources, "official_bib", side_effect=net.RateLimited("429")):
+            with self.assertRaises(net.RateLimited):
+                sources.lookup(r)
+        self.assertEqual(sources.lookup(rec())[1], "DBLP-metadata")
+
+    def test_springer_doi_check(self):
+        good = BIB.replace("Key_1", "10.1007/978-3-030-58452-8_13").replace("  doi = {10.1007/978-3-030-58452-8_13},\n", "")
+        with patch.object(sources, "fetch", return_value=("", good)):
+            self.assertEqual(sources.official_bib("Springer", "10.1007/978-3-030-58452-8_13"), good)
+        with patch.object(sources, "fetch", return_value=("", BIB)):
+            with self.assertRaises(net.FetchError):
+                sources.official_bib("Springer", "10.1007/other")
+
+    def test_neurips_new_link(self):
+        page = "<a href='/paper_files/paper/22372-/bibtex' class='btn'>Bibtex</a>"
+        cid = "https://proceedings.neurips.cc/paper_files/paper/2023/hash/" + "a" * 32 + "-Abstract-Conference.html"
+        with patch.object(sources, "fetch", side_effect=[(cid, page), ("", BIB)]) as f:
+            self.assertEqual(sources.official_bib("NeurIPS", cid), BIB)
+        self.assertEqual(f.call_args.args[0], "https://proceedings.neurips.cc/paper_files/paper/22372-/bibtex")
+
+
+class Net(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.patches = [patch.object(net, "CACHE", net.Path(self.tmp.name)), patch.object(net, "INTERVAL", 0)]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
+
+    def respond(self, text):
+        r = io.BytesIO(text.encode())
+        r.geturl = lambda: "https://final"
+        return contextlib.nullcontext(r)
+
+    def test_cache_and_check(self):
+        with patch("urllib.request.urlopen", return_value=self.respond("ok")) as u:
+            self.assertEqual(net.fetch("https://a", interval=0), ("https://final", "ok"))
+            self.assertEqual(net.fetch("https://a", interval=0), ("https://final", "ok"))
+        self.assertEqual(u.call_count, 1)
+        self.assertIn("AI-Bib-Helper", u.call_args.args[0].get_header("User-agent"))
+
+        def reject(_):
+            raise net.FetchError("bad")
+        for _ in range(2):  # a rejected response is not cached, so it is fetched again
+            with patch("urllib.request.urlopen", return_value=self.respond("x")) as u, \
+                 self.assertRaises(net.FetchError):
+                net.fetch("https://b", check=reject, interval=0)
+            self.assertEqual(u.call_count, 1)
+
+    def test_bot_check_and_rate_limit(self):
+        page = "<title>Making sure you&#39;re not a bot!</title>"
+        with patch("urllib.request.urlopen", return_value=self.respond(page)), \
+             self.assertRaisesRegex(net.FetchError, "bot check"):
+            net.fetch("https://c", interval=0)
+        err = urllib.error.HTTPError("https://d", 429, "Too Many", {}, None)
+        with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(net.RateLimited):
+            net.fetch("https://d", interval=0)
+        self.assertFalse([f for f in os.listdir(self.tmp.name) if f.endswith(".json")])
+
+
+class CLI(unittest.TestCase):
+    def run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_get_with_key(self):
+        with patch.object(sources, "search", return_value=[rec(versions=[rec()])]), \
+             patch.object(sources, "lookup", return_value=(BIB, "PMLR")):
+            code, out, err = self.run_cli("get", "a paper", "--key", "doe21")
+        self.assertEqual(code, 0)
+        self.assertEqual(bibtex.key(out), "doe21")
+        self.assertIn("% PMLR | 2021 ICLR [published] A Paper", err)
+
+    def test_get_doi_input_and_failure(self):
+        with patch.object(sources, "doi_bib", return_value=BIB) as d:
+            code, out, _ = self.run_cli("get", "https://doi.org/10.48550/arXiv.1706.03762")
+        d.assert_called_once_with("10.48550/arXiv.1706.03762")
+        self.assertEqual(code, 0)
+        with patch.object(sources, "search", return_value=[]):
+            code, out, err = self.run_cli("get", "nothing")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no DBLP match", err)
+
+    def test_rate_limit_stops_batch(self):
+        with patch.object(sources, "search", side_effect=net.RateLimited("429")) as s:
+            code, _, err = self.run_cli("get", "a", "b")
+        self.assertEqual((code, s.call_count), (2, 1))
+        self.assertIn("stopped", err)
+
+
+if __name__ == "__main__":
+    unittest.main()
