@@ -1,0 +1,34 @@
+src/aibib/cli.py
+  s_3cc1cf9708d23d::t_461c77c9acd506 92
+  s_3cc1cf9708d23d::t_e342c03fae48ab 100
+  s_3cc1cf9708d23d::t_027d2e5746b7cd 67
+  s_3cc1cf9708d23d::t_cbd2bc6c9675aa 20-24,26-27,32,37,41,46,52-53,55
+README.md
+  s_3cc1cf9708d23d::t_42032447c380eb 66-70
+  s_3cc1cf9708d23d::t_c6b51571f7e815 29
+src/aibib/sources.py
+  s_3cc1cf9708d23d::t_9086e162df9a4d 320
+  s_3cc1cf9708d23d::t_cd4c05a2512091 104
+  s_3cc1cf9708d23d::t_3717b091c3def5 6-7,16
+  s_3cc1cf9708d23d::t_83b48173d3949b 125-134,136-183
+  s_3cc1cf9708d23d::t_215519d46c8f8e 336-337
+tests/test_aibib.py
+  s_3cc1cf9708d23d::t_ae60d6096091a9 290-301
+  s_3cc1cf9708d23d::t_fa9c3636bf68b5 135-183
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e80349facdbbd8f834aa83ee041a736e251d5a20",
+  "prompts": {},
+  "sessions": {
+    "s_3cc1cf9708d23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1e691fc9-5f71-4813-989e-daa91ddcbd3a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "xzascc <xudongzhu3944@gmail.com>"
+    }
+  }
+}
