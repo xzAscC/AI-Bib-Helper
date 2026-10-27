@@ -23,7 +23,7 @@ aibib get "Attention is all you need"              # best match, official export
 aibib get "Denoising Diffusion Implicit Models" "Deep Residual Learning for Image Recognition"
 aibib get 10.18653/v1/N19-1423                     # DOI or paper URL
 aibib get "Scaling laws for neural language models" --key kaplan2020scaling
-aibib search "low rank adaptation large language models" -n 5   # list candidates
+aibib search "low-rank adaptation" -n 5            # list candidates
 aibib search "..." --json                          # for scripts and agents
 aibib get "..." --pick 2                           # take the 2nd candidate
 aibib --refresh get "..."                          # ignore the cache
@@ -43,10 +43,14 @@ Exit codes: 0 all found, 1 some failed, 2 rate-limited (stop and try later).
 
 ## How an entry is found
 
-1. **Search.** DBLP, through its SPARQL endpoint `sparql.dblp.org`. The full
-   query is first matched as a title phrase, then word by word. Versions of
-   the same paper are grouped, and the published version comes before the
-   arXiv/CoRR preprint.
+1. **Search.** DBLP, through its SPARQL endpoint `sparql.dblp.org`. The
+   query is matched as a phrase, then word by word, in the titles that start
+   with its first word; QLever answers these from its sorted index in under a
+   second. If both fail, the phrase is matched in all titles, a scan of about
+   10 s of the server's 30 s limit. So keywords find a paper only when the
+   first keyword starts its title or the keywords stand together in it.
+   Versions of the same paper are grouped, and the published version comes
+   before the arXiv/CoRR preprint.
 2. **Official export**, if DBLP lists a supported edition. The order is
    CVF, NeurIPS, PMLR, ACL Anthology, AAAI, IJCAI, Springer (also ECCV).
    DOI-based exports are checked against the paper's DOI.
@@ -80,7 +84,9 @@ Exit codes: 0 all found, 1 some failed, 2 rate-limited (stop and try later).
 - Responses are cached in `~/.cache/aibib` (or `$AIBIB_CACHE`), so a paper
   is never fetched twice.
 - Bot-check pages and invalid responses are not cached.
-- HTTP 429/503 stops the run with no retry.
+- HTTP 429/503 stops the run with no retry. QLever, the engine behind
+  `sparql.dblp.org`, also answers 429 when a query reaches its time limit
+  (`Operation timed out.`); that fails only the current paper.
 
 ## Development
 

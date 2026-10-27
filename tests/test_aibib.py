@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from unittest.mock import patch
 
 from aibib import bibtex, cli, net, sources
@@ -81,15 +82,37 @@ class Search(unittest.TestCase):
         ]
         with patch.object(sources, "sparql_records", return_value=hits) as q:
             groups = sources.search("attention is all you need")
-        q.assert_called_once_with(["attention is all you need"])
+        q.assert_called_once_with(["attention is all you need"], ["attention ", "Attention "])
         self.assertEqual(len(groups), 2)
         self.assertEqual(groups[0]["venue"], "NIPS")  # published before preprint
         self.assertEqual(len(groups[0]["versions"]), 2)
 
     def test_falls_back_to_words(self):
-        with patch.object(sources, "sparql_records", side_effect=[[], []]) as q:
+        with patch.object(sources, "sparql_records", side_effect=[[], [], []]) as q:
             self.assertEqual(sources.search("low rank adaptation of llms"), [])
-        self.assertEqual(q.call_args_list[1].args[0], ["adaptation", "llms", "rank", "low"])
+        starts = ["low ", "Low "]
+        self.assertEqual([c.args for c in q.call_args_list], [
+            (["low rank adaptation of llms"], starts),
+            (["adaptation", "llms", "rank", "low"], starts),
+            (["low rank adaptation of llms"], ()),
+        ])
+
+    def test_prefix_filter_and_timeout(self):
+        payload = json.dumps({"results": {"bindings": []}})
+        with patch.object(sources, "fetch", return_value=("", payload)) as f:
+            sources.sparql_records(["x"], ['A "b" ', "C"])
+        query = urllib.parse.parse_qs(f.call_args.args[1])["query"][0]
+        self.assertIn('FILTER(STRSTARTS(?title, "A \\"b\\" ") || STRSTARTS(?title, "C")) '
+                      'FILTER(CONTAINS(LCASE(STR(?title)), "x"))', query)
+        # QLever's 429 for a timed-out query fails that query only; a plain 429 stops the run.
+        timeout = net.RateLimited("429", '{"exception": "Operation timed out.", "status": "ERROR"}')
+        with patch.object(sources, "fetch", side_effect=timeout), \
+             self.assertRaisesRegex(net.FetchError, "timed out") as cm:
+            sources.sparql_records(["x"])
+        self.assertNotIsInstance(cm.exception, net.RateLimited)
+        with patch.object(sources, "fetch", side_effect=net.RateLimited("429")), \
+             self.assertRaises(net.RateLimited):
+            sources.sparql_records(["x"])
 
     def test_sparql_parsing(self):
         payload = {"results": {"bindings": [{
@@ -183,9 +206,10 @@ class Net(unittest.TestCase):
         with patch("urllib.request.urlopen", return_value=self.respond(page)), \
              self.assertRaisesRegex(net.FetchError, "bot check"):
             net.fetch("https://c", interval=0)
-        err = urllib.error.HTTPError("https://d", 429, "Too Many", {}, None)
-        with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(net.RateLimited):
+        err = urllib.error.HTTPError("https://d", 429, "Too Many", {}, io.BytesIO(b"Operation timed out."))
+        with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(net.RateLimited) as cm:
             net.fetch("https://d", interval=0)
+        self.assertEqual(cm.exception.body, "Operation timed out.")
         self.assertFalse([f for f in os.listdir(self.tmp.name) if f.endswith(".json")])
 
 

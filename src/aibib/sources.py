@@ -14,7 +14,7 @@ import unicodedata
 import urllib.parse
 
 from . import bibtex
-from .net import fetch, FetchError
+from .net import fetch, FetchError, RateLimited
 
 # Open proceedings first when one record lists several. IEEE Xplore and
 # OpenReview block scripts, so their papers fall back to the DOI or DBLP metadata.
@@ -34,7 +34,7 @@ SELECT ?p ?title (SAMPLE(?y) AS ?year) (SAMPLE(?v) AS ?venue) (SAMPLE(?d) AS ?do
   (GROUP_CONCAT(DISTINCT STR(?t); separator=" ") AS ?types)
   (GROUP_CONCAT(DISTINCT STR(?e); separator=" ") AS ?ees)
   (GROUP_CONCAT(DISTINCT CONCAT(STR(?o), "|", ?n); separator="\\n") AS ?authors) WHERE {
- { SELECT ?p ?title WHERE { ?p dblp:title ?title . FILTER(%s) } LIMIT 200 }
+ { SELECT ?p ?title WHERE { ?p dblp:title ?title . %s } LIMIT 200 }
  OPTIONAL { ?p dblp:yearOfPublication ?y } OPTIONAL { ?p dblp:publishedIn ?v }
  OPTIONAL { ?p dblp:doi ?d } OPTIONAL { ?p dblp:documentPage ?e } OPTIONAL { ?p rdf:type ?t }
  OPTIONAL { ?p dblp:bibtexType ?bt } OPTIONAL { ?p dblp:publishedAsPartOf/dblp:title ?pt }
@@ -44,19 +44,34 @@ SELECT ?p ?title (SAMPLE(?y) AS ?year) (SAMPLE(?v) AS ?venue) (SAMPLE(?d) AS ?do
 } GROUP BY ?p ?title"""
 
 
-def sparql_records(words):
-    """DBLP records whose lower-cased title contains every string in words."""
+def sparql_records(words, starts=()):
+    """DBLP records whose lower-cased title contains every string in words.
+
+    starts, if given, keeps only titles that begin with one of its strings.
+    QLever answers this prefix filter from its sorted index in under a second;
+    without it the query scans every title in DBLP (about 10 s on the server).
+    """
     lit = lambda w: '"' + w.replace("\\", "\\\\").replace('"', '\\"') + '"'
     cond = " && ".join(f"CONTAINS(LCASE(STR(?title)), {lit(w)})" for w in words)
-    data = urllib.parse.urlencode({"query": QUERY % cond})
+    filters = f"FILTER({cond})"
+    if starts:
+        filters = "FILTER(" + " || ".join(f"STRSTARTS(?title, {lit(s)})" for s in starts) + ") " + filters
+    data = urllib.parse.urlencode({"query": QUERY % filters})
 
     def check(text):
         if "results" not in json.loads(text):
             raise FetchError("DBLP SPARQL returned an error")
 
-    _, text = fetch(SPARQL, data, {"Accept": "application/sparql-results+json",
-                                   "Content-Type": "application/x-www-form-urlencoded"},
-                    check=check, interval=10)
+    try:
+        _, text = fetch(SPARQL, data, {"Accept": "application/sparql-results+json",
+                                       "Content-Type": "application/x-www-form-urlencoded"},
+                        check=check, interval=10)
+    except RateLimited as e:
+        # QLever also answers 429 when a query reaches the server's time limit
+        # ("Operation timed out."): the query was too slow, not too frequent.
+        if "timed out" in e.body:
+            raise FetchError("DBLP SPARQL query timed out") from None
+        raise
     out = []
     for b in json.loads(text)["results"]["bindings"]:
         v = lambda k: b.get(k, {}).get("value", "")
@@ -80,14 +95,23 @@ def search(query, n=5):
 
     Each group is a dict with title/authors/year/venue of its best version and
     'versions': all DBLP records of the same paper, published before preprint.
-    The whole query is matched as a title phrase first, then word by word.
+    The query is matched as a phrase, then word by word, in the titles that
+    start with its first word; if both fail, as a phrase in all titles.
     """
     phrase = " ".join(query.lower().split())
-    hits = sparql_records([phrase])
-    if not hits:
-        # Longest words first, deterministic so the cached query is reused.
-        words = sorted({w for w in re.split(r"[^\w]+", phrase) if len(w) > 2}, key=lambda w: (-len(w), w))
-        hits = sparql_records(words[:4]) if words else []
+    # Longest words first, deterministic so the cached query is reused.
+    words = sorted({w for w in re.split(r"[^\w]+", phrase) if len(w) > 2}, key=lambda w: (-len(w), w))[:4]
+    head, *rest = query.split() or [""]
+    first = head + (" " if rest else "")
+    # DBLP capitalizes a title's first word; also try the query's own spelling.
+    starts = list(dict.fromkeys([first, first[:1].upper() + first[1:]]))
+    # Cheapest first: the prefix queries take under a second. The last one scans
+    # every title, about 10 s of the server's 30 s limit; a scan for several
+    # words takes longer than the limit, so it is not tried.
+    hits = []
+    for w, s in ([phrase], starts), (words, starts), ([phrase], ()):
+        if head and w and (hits := sparql_records(w, s)):
+            break
 
     groups = {}
     for h in hits:
