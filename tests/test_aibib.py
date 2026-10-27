@@ -96,6 +96,21 @@ class Search(unittest.TestCase):
             (["low rank adaptation of llms"], ()),
         ])
 
+    def test_word_step_needs_only_the_first_letter(self):
+        cases = {  # query -> (first-word prefixes, first-letter prefixes)
+            "lora low-rank adaptation of large language models": (["lora ", "Lora "], ["L", "l"]),
+            "ATTENTION is all you need": (["ATTENTION "], ["A", "a"]),
+            '"Why should I trust you?"': (['"Why '], ['"']),
+            "3D Gaussian splatting": (["3D "], ["3"]),
+        }
+        for query, (starts, letters) in cases.items():
+            with patch.object(sources, "sparql_records", side_effect=[[], [rec()]]) as q:
+                sources.search(query)
+            self.assertEqual([c.args[1] for c in q.call_args_list], [starts, letters], query)
+        # "lora" is not among the words, so the word step finds "LoRA: ..." by the others.
+        self.assertEqual(sources.key_words("lora low-rank adaptation of large language models"),
+                         ["adaptation", "language", "models", "large"])
+
     def test_prefix_filter_and_timeout(self):
         payload = json.dumps({"results": {"bindings": []}})
         with patch.object(sources, "fetch", return_value=("", payload)) as f:
@@ -177,6 +192,10 @@ class Arxiv(unittest.TestCase):
             groups = sources.arxiv_search("principled attention boosting")
         self.assertEqual(self.search_query(f.call_args), "ti:principled AND ti:attention AND ti:boosting")
         self.assertEqual(len(groups), 2)
+
+    def test_check_passes_a_feed(self):
+        with patch.object(sources, "fetch", side_effect=lambda url, check: (check(FEED), ("", FEED))[1]):
+            self.assertEqual(len(sources.arxiv_records(["x"])), 2)
 
     def test_rejects_non_feed(self):
         for page in ("<html><body>Down for maintenance</body></html", "<html/>", ""):
