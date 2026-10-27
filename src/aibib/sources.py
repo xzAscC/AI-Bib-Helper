@@ -3,7 +3,8 @@
 Ported from Overleaf-Bib-Helper (MIT, MLNLP-World). DBLP finds the paper and
 lists its electronic editions; when one of them is a supported publisher, the
 publisher's own export is used, otherwise the DOI agency's (Crossref/DataCite),
-otherwise an entry built from DBLP's own metadata.
+otherwise an entry built from DBLP's own metadata. arXiv search is the
+alternative for papers DBLP does not list; their entries come from DataCite.
 """
 
 import difflib
@@ -12,6 +13,7 @@ import json
 import re
 import unicodedata
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 from . import bibtex
 from .net import fetch, FetchError, RateLimited
@@ -99,8 +101,7 @@ def search(query, n=5):
     start with its first word; if both fail, as a phrase in all titles.
     """
     phrase = " ".join(query.lower().split())
-    # Longest words first, deterministic so the cached query is reused.
-    words = sorted({w for w in re.split(r"[^\w]+", phrase) if len(w) > 2}, key=lambda w: (-len(w), w))[:4]
+    words = key_words(phrase)
     head, *rest = query.split() or [""]
     first = head + (" " if rest else "")
     # DBLP capitalizes a title's first word; also try the query's own spelling.
@@ -121,9 +122,65 @@ def search(query, n=5):
     for versions in groups.values():
         versions.sort(key=is_preprint)
         out.append(dict(versions[0], versions=versions))
+    return by_title(query, out)[:n]
+
+
+def key_words(text):
+    """The four longest words of text, longest first; deterministic so cached queries are reused."""
+    return sorted({w for w in re.split(r"[^\w]+", text.lower()) if len(w) > 2}, key=lambda w: (-len(w), w))[:4]
+
+
+def by_title(query, groups):
+    """groups sorted by how close their title is to query, then by year."""
     q = norm(query)
-    out.sort(key=lambda g: (-difflib.SequenceMatcher(None, q, norm(g["title"])).ratio(), g["year"]))
-    return out[:n]
+    return sorted(groups, key=lambda g: (-difflib.SequenceMatcher(None, q, norm(g["title"])).ratio(), g["year"]))
+
+
+# ---------- arXiv ----------
+# The arXiv API asks for one request at a time, at least 3 s apart, as fetch does.
+
+ARXIV = "https://export.arxiv.org/api/query"
+ATOM = {"a": "http://www.w3.org/2005/Atom"}
+
+
+def arxiv_records(terms):
+    """arXiv papers whose title matches every term (a word or a quoted phrase)."""
+    query = urllib.parse.urlencode({"search_query": " AND ".join(f"ti:{t}" for t in terms),
+                                    "max_results": 20})
+
+    def check(text):
+        if ET.fromstring(text).tag != "{http://www.w3.org/2005/Atom}feed":
+            raise FetchError("arXiv API returned no Atom feed")
+
+    _, text = fetch(f"{ARXIV}?{query}", check=check)
+    out = []
+    for e in ET.fromstring(text).iterfind("a:entry", ATOM):
+        # <id> is http://arxiv.org/abs/<id>v<n>; errors come as entries with another <id>.
+        aid = e.findtext("a:id", "", ATOM).partition("/abs/")[2]
+        if not aid:
+            continue
+        aid = re.sub(r"v\d+$", "", aid)
+        out.append({
+            "title": " ".join(e.findtext("a:title", "", ATOM).split()),
+            "authors": [a.findtext("a:name", "", ATOM) for a in e.iterfind("a:author", ATOM)],
+            "venue": "arXiv", "year": e.findtext("a:published", "", ATOM)[:4],
+            "type": "Informal", "dblp": "", "doi": f"10.48550/arXiv.{aid}",
+            "ee": [], "url": f"https://arxiv.org/abs/{aid}",
+        })
+    return out
+
+
+def arxiv_search(query, n=5):
+    """Return up to n arXiv papers, best title match first, shaped like search's groups.
+
+    The query is matched as a title phrase, then by its four longest words.
+    """
+    # arXiv's query syntax gives punctuation a meaning; keep only the words.
+    words = re.findall(r"\w+", query)
+    hits = arxiv_records(['"' + " ".join(words) + '"']) if words else []
+    if not hits and (longest := key_words(query)):
+        hits = arxiv_records(longest)
+    return by_title(query, [dict(h, versions=[h]) for h in hits])[:n]
 
 
 def is_preprint(rec):
@@ -260,7 +317,7 @@ def official_bib(source, cid):
 # ---------- one entry point ----------
 
 def lookup(rec, use_official=True):
-    """Return (bib, source label) for a DBLP record; fall back to its DOI on failure."""
+    """Return (bib, source label) for a DBLP or arXiv record; fall back to its DOI on failure."""
     note = ""
     if use_official and (target := best_official(rec)):
         try:
@@ -276,6 +333,8 @@ def lookup(rec, use_official=True):
             if e.__class__.__name__ == "RateLimited":
                 raise
             note += f" (DOI failed: {e})"
+    if not rec["dblp"]:  # an arXiv record has no DBLP metadata to build from
+        raise FetchError("no BibTeX" + note)
     return dblp_meta_bib(rec), "DBLP-metadata" + note
 
 

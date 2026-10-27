@@ -26,6 +26,7 @@ aibib get "Scaling laws for neural language models" --key kaplan2020scaling
 aibib search "low-rank adaptation" -n 5            # list candidates
 aibib search "..." --json                          # for scripts and agents
 aibib get "..." --pick 2                           # take the 2nd candidate
+aibib get --arxiv "..."                            # find it on arXiv, not DBLP (also for search)
 aibib --refresh get "..."                          # ignore the cache
 ```
 
@@ -61,6 +62,11 @@ Exit codes: 0 all found, 1 some failed, 2 rate-limited (stop and try later).
    papers on OpenReview, or JMLR), the entry is built from DBLP's record. This
    is the same data that dblp.org's own export uses. The source shows as
    `DBLP-metadata`.
+
+With `--arxiv`, step 1 searches arXiv instead, through its API
+`export.arxiv.org` (the title as a phrase, then its four longest words), for
+papers that DBLP does not list yet. The entry is the arXiv version's DataCite
+record (step 3).
 
 ### Differences from the userscript
 
