@@ -1,0 +1,37 @@
+src/aibib/net.py
+  s_3cc1cf9708d23d::t_a6874b7ff4c345 62-66
+  s_3cc1cf9708d23d::t_0b1a5e4b028c44 5
+tests/test_aibib.py
+  s_3cc1cf9708d23d::t_732825d7f39cdc 106,109,111-112
+  s_3cc1cf9708d23d::t_4d69d7f407ef37 94-95
+  s_3cc1cf9708d23d::t_7e8b65c72f3967 181-186
+  s_3cc1cf9708d23d::t_72814f04531c55 311-313
+  s_3cc1cf9708d23d::t_95700fba96c815 266-273
+README.md
+  s_3cc1cf9708d23d::t_b40550ce63e604 95-97
+  s_3cc1cf9708d23d::t_301ba703c68cce 48-55
+src/aibib/sources.py
+  s_3cc1cf9708d23d::t_43c06d98db1357 53-54
+  s_3cc1cf9708d23d::t_323cf79793722a 159-163
+  s_3cc1cf9708d23d::t_24200cc94b4c4f 72-77
+  s_3cc1cf9708d23d::t_54e8e6bd2aafc7 102-104,112-118,120
+  s_3cc1cf9708d23d::t_59d1bc4d658460 337,344
+src/aibib/cli.py
+  s_3cc1cf9708d23d::t_8c2f2105498ce4 29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "41ad5dd28b6f3d20d6ee3401ff5918788b98f183",
+  "prompts": {},
+  "sessions": {
+    "s_3cc1cf9708d23d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1e691fc9-5f71-4813-989e-daa91ddcbd3a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "xzascc <xudongzhu3944@gmail.com>"
+    }
+  }
+}
