@@ -26,7 +26,7 @@ def cmd_search(args):
     site, find = finder(args.arxiv)
     groups = find(args.query, args.n)
     if args.json:
-        json.dump([{k: g[k] for k in ("title", "authors", "year", "venue", "dblp", "doi")}
+        json.dump([{k: g[k] for k in ("title", "authors", "year", "venue", "dblp", "url", "doi")}
                    | {"preprint": sources.is_preprint(g),
                       "official": (sources.best_official(g) or [None])[0],
                       "versions": [v["dblp"] or v["url"] for v in g["versions"]]} for g in groups],

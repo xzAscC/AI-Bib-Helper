@@ -2,6 +2,7 @@
 
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import time
@@ -58,8 +59,11 @@ def fetch(url, data=None, headers=None, check=None, interval=INTERVAL):
                 final, text = r.geturl(), r.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             if e.code in (429, 503):
-                with e:
-                    body = e.read().decode("utf-8", "replace")
+                try:
+                    with e:
+                        body = e.read().decode("utf-8", "replace")
+                except (OSError, http.client.HTTPException):
+                    body = ""  # the body only refines the message; the status decides
                 raise RateLimited(f"{e.code} from {url}; stop and retry later with a longer interval",
                                   body) from None
             raise FetchError(f"HTTP {e.code} from {url}") from None

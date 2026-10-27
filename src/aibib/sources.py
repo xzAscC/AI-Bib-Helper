@@ -50,8 +50,8 @@ def sparql_records(words, starts=()):
     """DBLP records whose lower-cased title contains every string in words.
 
     starts, if given, keeps only titles that begin with one of its strings.
-    QLever answers this prefix filter from its sorted index in under a second;
-    without it the query scans every title in DBLP (about 10 s on the server).
+    QLever answers this prefix filter from its sorted index in a few seconds at
+    most; without it the query scans every title in DBLP (about 10 s on the server).
     """
     lit = lambda w: '"' + w.replace("\\", "\\\\").replace('"', '\\"') + '"'
     cond = " && ".join(f"CONTAINS(LCASE(STR(?title)), {lit(w)})" for w in words)
@@ -69,10 +69,12 @@ def sparql_records(words, starts=()):
                                        "Content-Type": "application/x-www-form-urlencoded"},
                         check=check, interval=10)
     except RateLimited as e:
-        # QLever also answers 429 when a query reaches the server's time limit
-        # ("Operation timed out."): the query was too slow, not too frequent.
-        if "timed out" in e.body:
-            raise FetchError("DBLP SPARQL query timed out") from None
+        # QLever also answers 429 when a query reaches the server's 30 s time
+        # limit. These queries take at most about 10 s, so a timeout means the
+        # server is busy: stop all the same, but say what happened.
+        if "Operation timed out" in e.body:
+            raise RateLimited("DBLP SPARQL query timed out, so the server is busy; "
+                              "stop and retry later", e.body) from None
         raise
     out = []
     for b in json.loads(text)["results"]["bindings"]:
@@ -97,8 +99,9 @@ def search(query, n=5):
 
     Each group is a dict with title/authors/year/venue of its best version and
     'versions': all DBLP records of the same paper, published before preprint.
-    The query is matched as a phrase, then word by word, in the titles that
-    start with its first word; if both fail, as a phrase in all titles.
+    The query is matched as a phrase in the titles that start with its first
+    word, then word by word in the titles that start with its first letter; if
+    both fail, as a phrase in all titles.
     """
     phrase = " ".join(query.lower().split())
     words = key_words(phrase)
@@ -106,11 +109,15 @@ def search(query, n=5):
     first = head + (" " if rest else "")
     # DBLP capitalizes a title's first word; also try the query's own spelling.
     starts = list(dict.fromkeys([first, first[:1].upper() + first[1:]]))
-    # Cheapest first: the prefix queries take under a second. The last one scans
-    # every title, about 10 s of the server's 30 s limit; a scan for several
-    # words takes longer than the limit, so it is not tried.
+    # The first letter alone also catches a first word written differently
+    # ("lora" for "LoRA:").
+    letters = list(dict.fromkeys([head[:1].upper(), head[:1].lower()]))
+    # Cheapest first: the prefix queries take under a second for a word, up to
+    # about 4 s for a common letter. The last one scans every title, about 10 s
+    # of the server's 30 s limit; a scan for several words takes longer than
+    # the limit, so it is not tried.
     hits = []
-    for w, s in ([phrase], starts), (words, starts), ([phrase], ()):
+    for w, s in ([phrase], starts), (words, letters), ([phrase], ()):
         if head and w and (hits := sparql_records(w, s)):
             break
 
@@ -149,7 +156,11 @@ def arxiv_records(terms):
                                     "max_results": 20})
 
     def check(text):
-        if ET.fromstring(text).tag != "{http://www.w3.org/2005/Atom}feed":
+        try:
+            feed = ET.fromstring(text).tag == f"{{{ATOM['a']}}}feed"
+        except ET.ParseError:  # an HTML error or maintenance page
+            feed = False
+        if not feed:
             raise FetchError("arXiv API returned no Atom feed")
 
     _, text = fetch(f"{ARXIV}?{query}", check=check)
@@ -323,14 +334,14 @@ def lookup(rec, use_official=True):
         try:
             return official_bib(*target), target[0]
         except (FetchError, bibtex.BibError) as e:
-            if e.__class__.__name__ == "RateLimited":
+            if isinstance(e, RateLimited):
                 raise
             note = f" (official {target[0]} failed: {e})"
     if rec.get("doi"):
         try:
             return doi_bib(rec["doi"]), "DOI" + note
         except (FetchError, bibtex.BibError) as e:
-            if e.__class__.__name__ == "RateLimited":
+            if isinstance(e, RateLimited):
                 raise
             note += f" (DOI failed: {e})"
     if not rec["dblp"]:  # an arXiv record has no DBLP metadata to build from

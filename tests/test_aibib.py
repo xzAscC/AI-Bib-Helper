@@ -90,10 +90,9 @@ class Search(unittest.TestCase):
     def test_falls_back_to_words(self):
         with patch.object(sources, "sparql_records", side_effect=[[], [], []]) as q:
             self.assertEqual(sources.search("low rank adaptation of llms"), [])
-        starts = ["low ", "Low "]
         self.assertEqual([c.args for c in q.call_args_list], [
-            (["low rank adaptation of llms"], starts),
-            (["adaptation", "llms", "rank", "low"], starts),
+            (["low rank adaptation of llms"], ["low ", "Low "]),
+            (["adaptation", "llms", "rank", "low"], ["L", "l"]),
             (["low rank adaptation of llms"], ()),
         ])
 
@@ -104,14 +103,13 @@ class Search(unittest.TestCase):
         query = urllib.parse.parse_qs(f.call_args.args[1])["query"][0]
         self.assertIn('FILTER(STRSTARTS(?title, "A \\"b\\" ") || STRSTARTS(?title, "C")) '
                       'FILTER(CONTAINS(LCASE(STR(?title)), "x"))', query)
-        # QLever's 429 for a timed-out query fails that query only; a plain 429 stops the run.
+        # QLever's 429 for a timed-out query stops the run too, with its own message.
         timeout = net.RateLimited("429", '{"exception": "Operation timed out.", "status": "ERROR"}')
         with patch.object(sources, "fetch", side_effect=timeout), \
-             self.assertRaisesRegex(net.FetchError, "timed out") as cm:
+             self.assertRaisesRegex(net.RateLimited, "timed out, so the server is busy"):
             sources.sparql_records(["x"])
-        self.assertNotIsInstance(cm.exception, net.RateLimited)
-        with patch.object(sources, "fetch", side_effect=net.RateLimited("429")), \
-             self.assertRaises(net.RateLimited):
+        with patch.object(sources, "fetch", side_effect=net.RateLimited("429 plain")), \
+             self.assertRaisesRegex(net.RateLimited, "429 plain"):
             sources.sparql_records(["x"])
 
     def test_sparql_parsing(self):
@@ -179,6 +177,12 @@ class Arxiv(unittest.TestCase):
             groups = sources.arxiv_search("principled attention boosting")
         self.assertEqual(self.search_query(f.call_args), "ti:principled AND ti:attention AND ti:boosting")
         self.assertEqual(len(groups), 2)
+
+    def test_rejects_non_feed(self):
+        for page in ("<html><body>Down for maintenance</body></html", "<html/>", ""):
+            with patch.object(sources, "fetch", side_effect=lambda url, check: check(page)), \
+                 self.assertRaisesRegex(net.FetchError, "no Atom feed"):
+                sources.arxiv_records(["x"])
 
 
 class Lookup(unittest.TestCase):
@@ -259,6 +263,14 @@ class Net(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(net.RateLimited) as cm:
             net.fetch("https://d", interval=0)
         self.assertEqual(cm.exception.body, "Operation timed out.")
+
+        class Dropped(io.BytesIO):  # the server closes the connection after the status line
+            def read(self, *a):
+                raise ConnectionResetError
+        err = urllib.error.HTTPError("https://e", 503, "Unavailable", {}, Dropped())
+        with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(net.RateLimited) as cm:
+            net.fetch("https://e", interval=0)
+        self.assertEqual(cm.exception.body, "")
         self.assertFalse([f for f in os.listdir(self.tmp.name) if f.endswith(".json")])
 
 
@@ -296,7 +308,9 @@ class CLI(unittest.TestCase):
             code, _, err = self.run_cli("get", "--arxiv", "a paper")
             self.assertEqual(self.run_cli("search", "--arxiv", "a paper")[:2],
                              (0, "1. " + cli.describe(g) + "\n   https://arxiv.org/abs/2506.13734\n"))
-        self.assertEqual((code, a.call_count, s.call_count), (0, 2, 0))
+            [j] = json.loads(self.run_cli("search", "--arxiv", "--json", "a paper")[1])
+        self.assertEqual((j["url"], j["versions"]), (g["url"], [g["url"]]))
+        self.assertEqual((code, a.call_count, s.call_count), (0, 3, 0))
         self.assertIn("% DOI | 2025 arXiv [preprint] A Paper", err)
 
     def test_rate_limit_stops_batch(self):

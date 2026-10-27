@@ -45,13 +45,14 @@ Exit codes: 0 all found, 1 some failed, 2 rate-limited (stop and try later).
 ## How an entry is found
 
 1. **Search.** DBLP, through its SPARQL endpoint `sparql.dblp.org`. The
-   query is matched as a phrase, then word by word, in the titles that start
-   with its first word; QLever answers these from its sorted index in under a
-   second. If both fail, the phrase is matched in all titles, a scan of about
-   10 s of the server's 30 s limit. So keywords find a paper only when the
-   first keyword starts its title or the keywords stand together in it.
-   Versions of the same paper are grouped, and the published version comes
-   before the arXiv/CoRR preprint.
+   query is matched as a phrase in the titles that start with its first word,
+   then by its four longest words in the titles that start with its first
+   letter; QLever answers these from its sorted index in a few seconds at
+   most. If both fail, the phrase is matched in all titles, a scan of about
+   10 s of the server's 30 s limit. So keywords find a paper only when its
+   title starts with the first keyword's letter or the keywords stand
+   together in it. Versions of the same paper are grouped, and the published
+   version comes before the arXiv/CoRR preprint.
 2. **Official export**, if DBLP lists a supported edition. The order is
    CVF, NeurIPS, PMLR, ACL Anthology, AAAI, IJCAI, Springer (also ECCV).
    DOI-based exports are checked against the paper's DOI.
@@ -91,8 +92,9 @@ record (step 3).
   is never fetched twice.
 - Bot-check pages and invalid responses are not cached.
 - HTTP 429/503 stops the run with no retry. QLever, the engine behind
-  `sparql.dblp.org`, also answers 429 when a query reaches its time limit
-  (`Operation timed out.`); that fails only the current paper.
+  `sparql.dblp.org`, also answers 429 when a query reaches its 30 s time
+  limit (`Operation timed out.`). The searches above take at most about 10 s,
+  so this means the server is busy; the run stops with a message that says so.
 
 ## Development
 
