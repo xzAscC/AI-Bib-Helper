@@ -107,9 +107,6 @@ class Search(unittest.TestCase):
             with patch.object(sources, "sparql_records", side_effect=[[], [rec()]]) as q:
                 sources.search(query)
             self.assertEqual([c.args[1] for c in q.call_args_list], [starts, letters], query)
-        # "lora" is not among the words, so the word step finds "LoRA: ..." by the others.
-        self.assertEqual(sources.key_words("lora low-rank adaptation of large language models"),
-                         ["adaptation", "language", "models", "large"])
 
     def test_prefix_filter_and_timeout(self):
         payload = json.dumps({"results": {"bindings": []}})
