@@ -1,0 +1,20 @@
+skills/bib-lookup/SKILL.md
+  s_b8824ec069e20f::t_8b268cf8677845 22-24
+  s_b8824ec069e20f::t_71635bcefabea2 87-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c8e17568e09ab030766721d8fb508c43819f1e51",
+  "prompts": {},
+  "sessions": {
+    "s_b8824ec069e20f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d751042e-8da5-49ef-a168-1a28b99f3567",
+        "model": "unknown"
+      },
+      "human_author": "xzascc <xudongzhu3944@gmail.com>"
+    }
+  }
+}
