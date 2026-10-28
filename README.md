@@ -42,6 +42,24 @@ paper.
 
 Exit codes: 0 all found, 1 some failed, 2 rate-limited (stop and try later).
 
+## Lookup order for agents
+
+`aibib` covers DBLP and arXiv. Google Scholar disallows scripts, so an agent
+reads it in the user's own browser instead. The full order is:
+
+1. DBLP through `aibib get`.
+2. Google Scholar in the browser, if DBLP has no match or lists only the
+   preprint of a published paper.
+3. arXiv through `aibib get --arxiv`.
+
+The skill [skills/bib-lookup/SKILL.md](skills/bib-lookup/SKILL.md) gives the
+steps and the checks for each source. Agents that read `SKILL.md` files
+(Claude Code, Codex, pi) can use it from a link:
+
+```bash
+ln -s "$PWD/skills/bib-lookup" ~/.claude/skills/bib-lookup
+```
+
 ## How an entry is found
 
 1. **Search.** DBLP, through its SPARQL endpoint `sparql.dblp.org`. The
