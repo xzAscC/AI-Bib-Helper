@@ -17,35 +17,42 @@ def describe(g):
     return f'{g["year"]} {g["venue"]} [{kind}] {g["title"]} — {authors}'
 
 
+def finder(arxiv):
+    """The site to search and its search function."""
+    return ("arXiv", sources.arxiv_search) if arxiv else ("DBLP", sources.search)
+
+
 def cmd_search(args):
-    groups = sources.search(args.query, args.n)
+    site, find = finder(args.arxiv)
+    groups = find(args.query, args.n)
     if args.json:
-        json.dump([{k: g[k] for k in ("title", "authors", "year", "venue", "dblp", "doi")}
+        json.dump([{k: g[k] for k in ("title", "authors", "year", "venue", "dblp", "url", "doi")}
                    | {"preprint": sources.is_preprint(g),
                       "official": (sources.best_official(g) or [None])[0],
-                      "versions": [v["dblp"] for v in g["versions"]]} for g in groups],
+                      "versions": [v["dblp"] or v["url"] for v in g["versions"]]} for g in groups],
                   sys.stdout, ensure_ascii=False, indent=1)
         print()
     for i, g in enumerate(groups, 1):
         if not args.json:
-            print(f"{i}. {describe(g)}\n   {g['dblp']}")
+            print(f"{i}. {describe(g)}\n   {g['dblp'] or g['url']}")
             for v in g["versions"][1:]:
                 print(f"   also: {v['year']} {v['venue']} {v['dblp']}")
     if not groups:
-        print("no DBLP results", file=sys.stderr)
+        print(f"no {site} results", file=sys.stderr)
         return 1
     return 0
 
 
-def resolve(query, pick, use_official):
+def resolve(query, pick, use_official, arxiv=False):
     """Return (bib, note) for a title/keywords, DOI or paper URL."""
     if use_official and (target := sources.official(query)):
         return sources.official_bib(*target), f"{target[0]} {query}"
     if doi := sources.doi_of(query):
         return sources.doi_bib(doi), f"DOI {doi}"
-    groups = sources.search(query, max(pick, 5))
+    site, find = finder(arxiv)
+    groups = find(query, max(pick, 5))
     if len(groups) < pick:
-        raise net.FetchError(f"no DBLP match #{pick} for: {query}")
+        raise net.FetchError(f"no {site} match #{pick} for: {query}")
     g = groups[pick - 1]
     bib, source = sources.lookup(g, use_official)
     return bib, f"{source} | {describe(g)}"
@@ -57,7 +64,7 @@ def cmd_get(args):
     status = 0
     for q in args.query:
         try:
-            bib, note = resolve(q, args.pick, not args.doi)
+            bib, note = resolve(q, args.pick, not args.doi, args.arxiv)
         except net.RateLimited as e:
             print(f"% stopped: {e}", file=sys.stderr)
             return 2
@@ -82,6 +89,7 @@ def main(argv=None):
     s.add_argument("query")
     s.add_argument("-n", type=int, default=5, help="number of papers (default 5)")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--arxiv", action="store_true", help="search arXiv instead of DBLP")
     s.set_defaults(func=cmd_search)
 
     g = sub.add_parser("get", help="print BibTeX for each query")
@@ -89,6 +97,7 @@ def main(argv=None):
     g.add_argument("--pick", type=int, default=1, help="use the Nth search match (default 1)")
     g.add_argument("--doi", action="store_true", help="use the DOI agency's export, not the publisher's")
     g.add_argument("--key", help="replace the citation key")
+    g.add_argument("--arxiv", action="store_true", help="find the paper on arXiv instead of DBLP")
     g.set_defaults(func=cmd_get)
 
     args = p.parse_args(argv)

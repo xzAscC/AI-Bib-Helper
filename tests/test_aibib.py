@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from unittest.mock import patch
 
 from aibib import bibtex, cli, net, sources
@@ -81,15 +82,47 @@ class Search(unittest.TestCase):
         ]
         with patch.object(sources, "sparql_records", return_value=hits) as q:
             groups = sources.search("attention is all you need")
-        q.assert_called_once_with(["attention is all you need"])
+        q.assert_called_once_with(["attention is all you need"], ["attention ", "Attention "])
         self.assertEqual(len(groups), 2)
         self.assertEqual(groups[0]["venue"], "NIPS")  # published before preprint
         self.assertEqual(len(groups[0]["versions"]), 2)
 
     def test_falls_back_to_words(self):
-        with patch.object(sources, "sparql_records", side_effect=[[], []]) as q:
+        with patch.object(sources, "sparql_records", side_effect=[[], [], []]) as q:
             self.assertEqual(sources.search("low rank adaptation of llms"), [])
-        self.assertEqual(q.call_args_list[1].args[0], ["adaptation", "llms", "rank", "low"])
+        self.assertEqual([c.args for c in q.call_args_list], [
+            (["low rank adaptation of llms"], ["low ", "Low "]),
+            (["adaptation", "llms", "rank", "low"], ["L", "l"]),
+            (["low rank adaptation of llms"], ()),
+        ])
+
+    def test_word_step_needs_only_the_first_letter(self):
+        cases = {  # query -> (first-word prefixes, first-letter prefixes)
+            "lora low-rank adaptation of large language models": (["lora ", "Lora "], ["L", "l"]),
+            "ATTENTION is all you need": (["ATTENTION "], ["A", "a"]),
+            '"Why should I trust you?"': (['"Why '], ['"']),
+            "3D Gaussian splatting": (["3D "], ["3"]),
+        }
+        for query, (starts, letters) in cases.items():
+            with patch.object(sources, "sparql_records", side_effect=[[], [rec()]]) as q:
+                sources.search(query)
+            self.assertEqual([c.args[1] for c in q.call_args_list], [starts, letters], query)
+
+    def test_prefix_filter_and_timeout(self):
+        payload = json.dumps({"results": {"bindings": []}})
+        with patch.object(sources, "fetch", return_value=("", payload)) as f:
+            sources.sparql_records(["x"], ['A "b" ', "C"])
+        query = urllib.parse.parse_qs(f.call_args.args[1])["query"][0]
+        self.assertIn('FILTER(STRSTARTS(?title, "A \\"b\\" ") || STRSTARTS(?title, "C")) '
+                      'FILTER(CONTAINS(LCASE(STR(?title)), "x"))', query)
+        # QLever's 429 for a timed-out query stops the run too, with its own message.
+        timeout = net.RateLimited("429", '{"exception": "Operation timed out.", "status": "ERROR"}')
+        with patch.object(sources, "fetch", side_effect=timeout), \
+             self.assertRaisesRegex(net.RateLimited, "timed out, so the server is busy"):
+            sources.sparql_records(["x"])
+        with patch.object(sources, "fetch", side_effect=net.RateLimited("429 plain")), \
+             self.assertRaisesRegex(net.RateLimited, "429 plain"):
+            sources.sparql_records(["x"])
 
     def test_sparql_parsing(self):
         payload = {"results": {"bindings": [{
@@ -107,6 +140,65 @@ class Search(unittest.TestCase):
         self.assertIn('\\"quoted\\"', f.call_args.args[1].replace("%5C", "\\").replace("%22", '"'))
         self.assertEqual(r["authors"], ["Jiaming Song", "Chenlin Meng", "Stefano Ermon"])
         self.assertEqual((r["title"], r["bibtype"], r["type"]), ("Denoising Diffusion Implicit Models", "inproceedings", "Inproceedings"))
+
+
+FEED = """<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2506.13734v3</id>
+    <title>Instruction Following by Principled Boosting
+  Attention of Large Language Models</title>
+    <published>2025-06-16T17:42:35Z</published>
+    <author><name>Vitoria Guardieiro</name></author>
+    <author><name>Eric Wong</name></author>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/hep-th/9901001v2</id>
+    <title>Another Paper</title>
+    <published>1999-01-04T00:00:00Z</published>
+  </entry>
+</feed>"""
+
+
+class Arxiv(unittest.TestCase):
+    def search_query(self, call):
+        return urllib.parse.parse_qs(urllib.parse.urlsplit(call.args[0]).query)["search_query"][0]
+
+    def test_records_and_lookup(self):
+        with patch.object(sources, "fetch", return_value=("", FEED)) as f:
+            g, other = sources.arxiv_search("Instruction Following by Principled Attention Boosting (of LLMs)")
+        self.assertEqual(self.search_query(f.call_args),
+                         'ti:"Instruction Following by Principled Attention Boosting of LLMs"')
+        self.assertEqual((g["title"], g["year"], g["doi"], g["url"], g["authors"]), (
+            "Instruction Following by Principled Boosting Attention of Large Language Models", "2025",
+            "10.48550/arXiv.2506.13734", "https://arxiv.org/abs/2506.13734", ["Vitoria Guardieiro", "Eric Wong"]))
+        self.assertTrue(sources.is_preprint(g))
+        self.assertEqual(other["doi"], "10.48550/arXiv.hep-th/9901001")
+        with patch.object(sources, "doi_bib", return_value=BIB) as d:
+            self.assertEqual(sources.lookup(g), (BIB, "DOI"))
+        d.assert_called_once_with("10.48550/arXiv.2506.13734")
+        # No DBLP record to build an entry from when DataCite fails.
+        with patch.object(sources, "doi_bib", side_effect=net.FetchError("down")), \
+             self.assertRaisesRegex(net.FetchError, "no BibTeX"):
+            sources.lookup(g)
+
+    def test_falls_back_to_words_and_skips_errors(self):
+        error = ('<feed xmlns="http://www.w3.org/2005/Atom"><entry>'
+                 '<id>http://arxiv.org/api/errors#bad</id><title>Error</title></entry></feed>')
+        with patch.object(sources, "fetch", side_effect=[("", error), ("", FEED)]) as f:
+            groups = sources.arxiv_search("principled attention boosting")
+        self.assertEqual(self.search_query(f.call_args), "ti:principled AND ti:attention AND ti:boosting")
+        self.assertEqual(len(groups), 2)
+
+    def test_check_passes_a_feed(self):
+        with patch.object(sources, "fetch", side_effect=lambda url, check: (check(FEED), ("", FEED))[1]):
+            self.assertEqual(len(sources.arxiv_records(["x"])), 2)
+
+    def test_rejects_non_feed(self):
+        for page in ("<html><body>Down for maintenance</body></html", "<html/>", ""):
+            with patch.object(sources, "fetch", side_effect=lambda url, check: check(page)), \
+                 self.assertRaisesRegex(net.FetchError, "no Atom feed"):
+                sources.arxiv_records(["x"])
 
 
 class Lookup(unittest.TestCase):
@@ -183,9 +275,18 @@ class Net(unittest.TestCase):
         with patch("urllib.request.urlopen", return_value=self.respond(page)), \
              self.assertRaisesRegex(net.FetchError, "bot check"):
             net.fetch("https://c", interval=0)
-        err = urllib.error.HTTPError("https://d", 429, "Too Many", {}, None)
-        with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(net.RateLimited):
+        err = urllib.error.HTTPError("https://d", 429, "Too Many", {}, io.BytesIO(b"Operation timed out."))
+        with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(net.RateLimited) as cm:
             net.fetch("https://d", interval=0)
+        self.assertEqual(cm.exception.body, "Operation timed out.")
+
+        class Dropped(io.BytesIO):  # the server closes the connection after the status line
+            def read(self, *a):
+                raise ConnectionResetError
+        err = urllib.error.HTTPError("https://e", 503, "Unavailable", {}, Dropped())
+        with patch("urllib.request.urlopen", side_effect=err), self.assertRaises(net.RateLimited) as cm:
+            net.fetch("https://e", interval=0)
+        self.assertEqual(cm.exception.body, "")
         self.assertFalse([f for f in os.listdir(self.tmp.name) if f.endswith(".json")])
 
 
@@ -213,6 +314,20 @@ class CLI(unittest.TestCase):
             code, out, err = self.run_cli("get", "nothing")
         self.assertEqual((code, out), (1, ""))
         self.assertIn("no DBLP match", err)
+
+    def test_arxiv_flag(self):
+        g = rec(venue="arXiv", type="Informal", dblp="", year="2025", url="https://arxiv.org/abs/2506.13734")
+        g["versions"] = [g]
+        with patch.object(sources, "arxiv_search", return_value=[g]) as a, \
+             patch.object(sources, "search") as s, \
+             patch.object(sources, "lookup", return_value=(BIB, "DOI")):
+            code, _, err = self.run_cli("get", "--arxiv", "a paper")
+            self.assertEqual(self.run_cli("search", "--arxiv", "a paper")[:2],
+                             (0, "1. " + cli.describe(g) + "\n   https://arxiv.org/abs/2506.13734\n"))
+            [j] = json.loads(self.run_cli("search", "--arxiv", "--json", "a paper")[1])
+        self.assertEqual((j["url"], j["versions"]), (g["url"], [g["url"]]))
+        self.assertEqual((code, a.call_count, s.call_count), (0, 3, 0))
+        self.assertIn("% DOI | 2025 arXiv [preprint] A Paper", err)
 
     def test_rate_limit_stops_batch(self):
         with patch.object(sources, "search", side_effect=net.RateLimited("429")) as s:

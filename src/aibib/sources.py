@@ -3,7 +3,8 @@
 Ported from Overleaf-Bib-Helper (MIT, MLNLP-World). DBLP finds the paper and
 lists its electronic editions; when one of them is a supported publisher, the
 publisher's own export is used, otherwise the DOI agency's (Crossref/DataCite),
-otherwise an entry built from DBLP's own metadata.
+otherwise an entry built from DBLP's own metadata. arXiv search is the
+alternative for papers DBLP does not list; their entries come from DataCite.
 """
 
 import difflib
@@ -12,9 +13,10 @@ import json
 import re
 import unicodedata
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 from . import bibtex
-from .net import fetch, FetchError
+from .net import fetch, FetchError, RateLimited
 
 # Open proceedings first when one record lists several. IEEE Xplore and
 # OpenReview block scripts, so their papers fall back to the DOI or DBLP metadata.
@@ -34,7 +36,7 @@ SELECT ?p ?title (SAMPLE(?y) AS ?year) (SAMPLE(?v) AS ?venue) (SAMPLE(?d) AS ?do
   (GROUP_CONCAT(DISTINCT STR(?t); separator=" ") AS ?types)
   (GROUP_CONCAT(DISTINCT STR(?e); separator=" ") AS ?ees)
   (GROUP_CONCAT(DISTINCT CONCAT(STR(?o), "|", ?n); separator="\\n") AS ?authors) WHERE {
- { SELECT ?p ?title WHERE { ?p dblp:title ?title . FILTER(%s) } LIMIT 200 }
+ { SELECT ?p ?title WHERE { ?p dblp:title ?title . %s } LIMIT 200 }
  OPTIONAL { ?p dblp:yearOfPublication ?y } OPTIONAL { ?p dblp:publishedIn ?v }
  OPTIONAL { ?p dblp:doi ?d } OPTIONAL { ?p dblp:documentPage ?e } OPTIONAL { ?p rdf:type ?t }
  OPTIONAL { ?p dblp:bibtexType ?bt } OPTIONAL { ?p dblp:publishedAsPartOf/dblp:title ?pt }
@@ -44,19 +46,36 @@ SELECT ?p ?title (SAMPLE(?y) AS ?year) (SAMPLE(?v) AS ?venue) (SAMPLE(?d) AS ?do
 } GROUP BY ?p ?title"""
 
 
-def sparql_records(words):
-    """DBLP records whose lower-cased title contains every string in words."""
+def sparql_records(words, starts=()):
+    """DBLP records whose lower-cased title contains every string in words.
+
+    starts, if given, keeps only titles that begin with one of its strings.
+    QLever answers this prefix filter from its sorted index in a few seconds at
+    most; without it the query scans every title in DBLP (about 10 s on the server).
+    """
     lit = lambda w: '"' + w.replace("\\", "\\\\").replace('"', '\\"') + '"'
     cond = " && ".join(f"CONTAINS(LCASE(STR(?title)), {lit(w)})" for w in words)
-    data = urllib.parse.urlencode({"query": QUERY % cond})
+    filters = f"FILTER({cond})"
+    if starts:
+        filters = "FILTER(" + " || ".join(f"STRSTARTS(?title, {lit(s)})" for s in starts) + ") " + filters
+    data = urllib.parse.urlencode({"query": QUERY % filters})
 
     def check(text):
         if "results" not in json.loads(text):
             raise FetchError("DBLP SPARQL returned an error")
 
-    _, text = fetch(SPARQL, data, {"Accept": "application/sparql-results+json",
-                                   "Content-Type": "application/x-www-form-urlencoded"},
-                    check=check, interval=10)
+    try:
+        _, text = fetch(SPARQL, data, {"Accept": "application/sparql-results+json",
+                                       "Content-Type": "application/x-www-form-urlencoded"},
+                        check=check, interval=10)
+    except RateLimited as e:
+        # QLever also answers 429 when a query reaches the server's 30 s time
+        # limit. These queries take at most about 10 s, so a timeout means the
+        # server is busy: stop all the same, but say what happened.
+        if "Operation timed out" in e.body:
+            raise RateLimited("DBLP SPARQL query timed out, so the server is busy; "
+                              "stop and retry later", e.body) from None
+        raise
     out = []
     for b in json.loads(text)["results"]["bindings"]:
         v = lambda k: b.get(k, {}).get("value", "")
@@ -80,14 +99,27 @@ def search(query, n=5):
 
     Each group is a dict with title/authors/year/venue of its best version and
     'versions': all DBLP records of the same paper, published before preprint.
-    The whole query is matched as a title phrase first, then word by word.
+    The query is matched as a phrase in the titles that start with its first
+    word, then word by word in the titles that start with its first letter; if
+    both fail, as a phrase in all titles.
     """
     phrase = " ".join(query.lower().split())
-    hits = sparql_records([phrase])
-    if not hits:
-        # Longest words first, deterministic so the cached query is reused.
-        words = sorted({w for w in re.split(r"[^\w]+", phrase) if len(w) > 2}, key=lambda w: (-len(w), w))
-        hits = sparql_records(words[:4]) if words else []
+    words = key_words(phrase)
+    head, *rest = query.split() or [""]
+    first = head + (" " if rest else "")
+    # DBLP capitalizes a title's first word; also try the query's own spelling.
+    starts = list(dict.fromkeys([first, first[:1].upper() + first[1:]]))
+    # The first letter alone also catches a first word written differently
+    # ("lora" for "LoRA:").
+    letters = list(dict.fromkeys([head[:1].upper(), head[:1].lower()]))
+    # Cheapest first: the prefix queries take under a second for a word, up to
+    # about 4 s for a common letter. The last one scans every title, about 10 s
+    # of the server's 30 s limit; a scan for several words takes longer than
+    # the limit, so it is not tried.
+    hits = []
+    for w, s in ([phrase], starts), (words, letters), ([phrase], ()):
+        if head and w and (hits := sparql_records(w, s)):
+            break
 
     groups = {}
     for h in hits:
@@ -97,9 +129,69 @@ def search(query, n=5):
     for versions in groups.values():
         versions.sort(key=is_preprint)
         out.append(dict(versions[0], versions=versions))
+    return by_title(query, out)[:n]
+
+
+def key_words(text):
+    """The four longest words of text, longest first; deterministic so cached queries are reused."""
+    return sorted({w for w in re.split(r"[^\w]+", text.lower()) if len(w) > 2}, key=lambda w: (-len(w), w))[:4]
+
+
+def by_title(query, groups):
+    """groups sorted by how close their title is to query, then by year."""
     q = norm(query)
-    out.sort(key=lambda g: (-difflib.SequenceMatcher(None, q, norm(g["title"])).ratio(), g["year"]))
-    return out[:n]
+    return sorted(groups, key=lambda g: (-difflib.SequenceMatcher(None, q, norm(g["title"])).ratio(), g["year"]))
+
+
+# ---------- arXiv ----------
+# The arXiv API asks for one request at a time, at least 3 s apart, as fetch does.
+
+ARXIV = "https://export.arxiv.org/api/query"
+ATOM = {"a": "http://www.w3.org/2005/Atom"}
+
+
+def arxiv_records(terms):
+    """arXiv papers whose title matches every term (a word or a quoted phrase)."""
+    query = urllib.parse.urlencode({"search_query": " AND ".join(f"ti:{t}" for t in terms),
+                                    "max_results": 20})
+
+    def check(text):
+        try:
+            feed = ET.fromstring(text).tag == f"{{{ATOM['a']}}}feed"
+        except ET.ParseError:  # an HTML error or maintenance page
+            feed = False
+        if not feed:
+            raise FetchError("arXiv API returned no Atom feed")
+
+    _, text = fetch(f"{ARXIV}?{query}", check=check)
+    out = []
+    for e in ET.fromstring(text).iterfind("a:entry", ATOM):
+        # <id> is http://arxiv.org/abs/<id>v<n>; errors come as entries with another <id>.
+        aid = e.findtext("a:id", "", ATOM).partition("/abs/")[2]
+        if not aid:
+            continue
+        aid = re.sub(r"v\d+$", "", aid)
+        out.append({
+            "title": " ".join(e.findtext("a:title", "", ATOM).split()),
+            "authors": [a.findtext("a:name", "", ATOM) for a in e.iterfind("a:author", ATOM)],
+            "venue": "arXiv", "year": e.findtext("a:published", "", ATOM)[:4],
+            "type": "Informal", "dblp": "", "doi": f"10.48550/arXiv.{aid}",
+            "ee": [], "url": f"https://arxiv.org/abs/{aid}",
+        })
+    return out
+
+
+def arxiv_search(query, n=5):
+    """Return up to n arXiv papers, best title match first, shaped like search's groups.
+
+    The query is matched as a title phrase, then by its four longest words.
+    """
+    # arXiv's query syntax gives punctuation a meaning; keep only the words.
+    words = re.findall(r"\w+", query)
+    hits = arxiv_records(['"' + " ".join(words) + '"']) if words else []
+    if not hits and (longest := key_words(query)):
+        hits = arxiv_records(longest)
+    return by_title(query, [dict(h, versions=[h]) for h in hits])[:n]
 
 
 def is_preprint(rec):
@@ -236,22 +328,24 @@ def official_bib(source, cid):
 # ---------- one entry point ----------
 
 def lookup(rec, use_official=True):
-    """Return (bib, source label) for a DBLP record; fall back to its DOI on failure."""
+    """Return (bib, source label) for a DBLP or arXiv record; fall back to its DOI on failure."""
     note = ""
     if use_official and (target := best_official(rec)):
         try:
             return official_bib(*target), target[0]
         except (FetchError, bibtex.BibError) as e:
-            if e.__class__.__name__ == "RateLimited":
+            if isinstance(e, RateLimited):
                 raise
             note = f" (official {target[0]} failed: {e})"
     if rec.get("doi"):
         try:
             return doi_bib(rec["doi"]), "DOI" + note
         except (FetchError, bibtex.BibError) as e:
-            if e.__class__.__name__ == "RateLimited":
+            if isinstance(e, RateLimited):
                 raise
             note += f" (DOI failed: {e})"
+    if not rec["dblp"]:  # an arXiv record has no DBLP metadata to build from
+        raise FetchError("no BibTeX" + note)
     return dblp_meta_bib(rec), "DBLP-metadata" + note
 
 
