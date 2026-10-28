@@ -19,8 +19,9 @@ If `aibib` is not installed, ask before you install it with
 
 1. Get the exact title from the paper or from the user. Do not guess a title
    from a topic. If you only have keywords, run `aibib search "<keywords>" -n 5`
-   and let the user pick. Keywords find a paper only when the first one
-   starts its title or they stand together in it.
+   and let the user pick. Keywords find a paper only when they stand
+   together in its title, or when its title starts with the first letter of
+   the first keyword and contains the four longest keywords.
 2. Run `aibib get "<exact title>"` (several titles in one call are fine; the
    tool spaces the requests). A DOI or paper URL also works.
 3. Read the `%` line on stderr for each entry. Check the title, the year and the
@@ -83,9 +84,9 @@ as `DOI` and `[preprint]`). `aibib search --arxiv` lists the candidates.
 
 ## Limits
 
-- Exit code 2 means the run was rate-limited. Stop, tell the user, and do not
-  retry in a loop. A DBLP query that reaches the server's time limit fails
-  only that paper (exit code 1).
+- Exit code 2 means the run was rate-limited, or a DBLP query reached the
+  server's time limit (the server is busy). Stop, tell the user, and do not
+  retry in a loop.
 - Do not use OpenReview or dblp.org pages directly; they block scripts. The
   user's browser userscript Overleaf-Bib-Helper (Chrome Profile 4,
   `Alt+Shift+B` in an Overleaf project) covers those cases by hand.
